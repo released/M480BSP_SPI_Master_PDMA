@@ -9,6 +9,7 @@
 #include "NuMicro.h"
 
 #define ENABLE_SPI_NON_AUTO_SS
+//#define ENABLE_SPI_RX
 
 #define SPI_SET_CS_LOW				(PB2 = 0)
 #define SPI_SET_CS_HIGH				(PB2 = 1)
@@ -20,6 +21,10 @@
 #define SPI_MASTER_TX_DMA_CH 		(0)
 #define SPI_MASTER_RX_DMA_CH 		(1)
 #define SPI_MASTER_OPENED_CH   	((1 << SPI_MASTER_TX_DMA_CH) | (1 << SPI_MASTER_RX_DMA_CH))
+
+#define SPI_MASTER_OPENED_CH_TX   	(1 << SPI_MASTER_TX_DMA_CH)
+#define SPI_MASTER_OPENED_CH_RX   	(1 << SPI_MASTER_RX_DMA_CH)
+
 
 //#define SPI_SLAVE_TX_DMA_CH  		(2)
 //#define SPI_SLAVE_RX_DMA_CH  		(3)
@@ -45,6 +50,7 @@ typedef enum{
 	flag_DEFAULT = 0 ,
 
 	flag_SPI_Transmit_timing ,
+	flag_SPI_Transmit_end ,
 	
 	flag_END	
 }Flag_Index;
@@ -92,6 +98,17 @@ void set_tick(uint32_t t)
 	conter_tick = t;
 }
 
+void SPI_Master_PDMA_TransmitFinish(void)
+{
+    #if defined (ENABLE_SPI_NON_AUTO_SS)	
+	while(!is_flag_set(flag_SPI_Transmit_end));
+	
+	while (SPI_IS_BUSY(SPI1));
+    // /CS: de-active
+	SPI_SET_CS_HIGH;
+	#endif		
+}
+
 void SPI_Master_PDMA_PreInit(void)
 {
     uint16_t i = 0;
@@ -100,6 +117,8 @@ void SPI_Master_PDMA_PreInit(void)
     #if defined (ENABLE_SPI_NON_AUTO_SS)
 	SPI_SET_CS_LOW;
 	#endif
+
+	set_flag(flag_SPI_Transmit_end,DISABLE);
 	
 	//prepare data
     for (i=0; i < DATA_NUM; i++)
@@ -121,6 +140,7 @@ void SPI_Master_PDMA_PreInit(void)
     /* Disable table interrupt */
     PDMA->DSCT[SPI_MASTER_TX_DMA_CH].CTL |= PDMA_DSCT_CTL_TBINTDIS_Msk;
 
+	#if defined (ENABLE_SPI_RX)
 	//RX	
     PDMA_SetTransferCnt(PDMA,SPI_MASTER_RX_DMA_CH, PDMA_WIDTH_8, DATA_NUM);
     /* Set source/destination address and attributes */
@@ -131,13 +151,17 @@ void SPI_Master_PDMA_PreInit(void)
     PDMA_SetBurstType(PDMA,SPI_MASTER_RX_DMA_CH, PDMA_REQ_SINGLE, 0);
     /* Disable table interrupt */
     PDMA->DSCT[SPI_MASTER_RX_DMA_CH].CTL |= PDMA_DSCT_CTL_TBINTDIS_Msk;
-
     SPI_TRIGGER_RX_PDMA(SPI1);
+    PDMA_EnableInt(PDMA, SPI_MASTER_RX_DMA_CH, PDMA_INT_TRANS_DONE);
+	#endif
+
     SPI_TRIGGER_TX_PDMA(SPI1);
 
     PDMA_EnableInt(PDMA, SPI_MASTER_TX_DMA_CH, PDMA_INT_TRANS_DONE);
-    PDMA_EnableInt(PDMA, SPI_MASTER_RX_DMA_CH, PDMA_INT_TRANS_DONE);
+
     NVIC_EnableIRQ(PDMA_IRQn);
+
+	SPI_Master_PDMA_TransmitFinish();
 	
 }
 
@@ -151,19 +175,22 @@ void SPI_Master_PDMA_Enable(uint8_t TxRx)
 	SPI_SET_CS_LOW;
 	#endif
 	
+	set_flag(flag_SPI_Transmit_end,DISABLE);
+
+	
 	if (TxRx == SPI_TX)
 	{
 		//prepare master TX data
 		g_au8MasterToSlaveTestPattern[0] = 0xAA;
 		g_au8MasterToSlaveTestPattern[1] = 0xDD;
 
-		j = 1;
 	    for (i = 2; i < DATA_NUM ; i++)
 	    {
-	        g_au8MasterToSlaveTestPattern[i] = (i + 0x10*(j++));
+	        g_au8MasterToSlaveTestPattern[i] = i;
 	    }
-		j = 0;
-	
+		g_au8MasterToSlaveTestPattern[DATA_NUM-1] = (uint8_t) 0x10*j;		//last byte for indicator
+		j++;
+		
 		//TX
 	    PDMA_SetTransferCnt(PDMA,SPI_MASTER_TX_DMA_CH, PDMA_WIDTH_8, DATA_NUM);
 		PDMA_SetTransferAddr(PDMA,SPI_MASTER_TX_DMA_CH, (uint32_t)g_au8MasterToSlaveTestPattern, PDMA_SAR_INC, (uint32_t)&SPI1->TX, PDMA_DAR_FIX);		
@@ -185,6 +212,7 @@ void SPI_Master_PDMA_Enable(uint8_t TxRx)
     	PDMA_EnableInt(PDMA, SPI_MASTER_RX_DMA_CH, PDMA_INT_TRANS_DONE);			
 	}
 
+	SPI_Master_PDMA_TransmitFinish();
 	
 }
 
@@ -237,6 +265,34 @@ void PDMA_IRQHandler(void)
     }
     else if (status & PDMA_INTSTS_TDIF_Msk)     /* done */
     {
+		#if 1
+        if((PDMA_GET_TD_STS(PDMA) & SPI_MASTER_OPENED_CH_TX) == SPI_MASTER_OPENED_CH_TX)
+        {
+            /* Clear PDMA transfer done interrupt flag */
+            PDMA_CLR_TD_FLAG(PDMA, SPI_MASTER_OPENED_CH_TX);
+
+			//insert process
+			SPI_DISABLE_TX_PDMA(SPI1);
+			LED_Y ^= 1;
+
+			set_flag(flag_SPI_Transmit_end,ENABLE);
+        } 
+
+		#if defined (ENABLE_SPI_RX)
+        if((PDMA_GET_TD_STS(PDMA) & SPI_MASTER_OPENED_CH_RX) == SPI_MASTER_OPENED_CH_RX)
+        {
+            /* Clear PDMA transfer done interrupt flag */
+            PDMA_CLR_TD_FLAG(PDMA, SPI_MASTER_OPENED_CH_RX);
+
+			//insert process
+			SPI_DISABLE_RX_PDMA(SPI1);
+			LED_Y ^= 1;
+
+			set_flag(flag_SPI_Transmit_end,ENABLE);
+        } 
+		#endif
+		
+		#else
         if((PDMA_GET_TD_STS(PDMA) & SPI_MASTER_OPENED_CH) == SPI_MASTER_OPENED_CH)
         {
             /* Clear PDMA transfer done interrupt flag */
@@ -246,13 +302,10 @@ void PDMA_IRQHandler(void)
 			SPI_DISABLE_TX_PDMA(SPI1);
 			SPI_DISABLE_RX_PDMA(SPI1);
 			LED_Y ^= 1;
-			
-		    #if defined (ENABLE_SPI_NON_AUTO_SS)
-		    // /CS: de-active
-			SPI_SET_CS_HIGH;
-			#endif		
 
-        }        		
+			set_flag(flag_SPI_Transmit_end,ENABLE);
+        } 
+		#endif
     }
     else if (status & (PDMA_INTSTS_REQTOF0_Msk | PDMA_INTSTS_REQTOF1_Msk))     /* Check the DMA time-out interrupt flag */
     {
@@ -419,7 +472,11 @@ int main()
 		if (is_flag_set(flag_SPI_Transmit_timing))	
 		{
 			set_flag(flag_SPI_Transmit_timing , DISABLE);
+
+			#if defined (ENABLE_SPI_RX)
 			SPI_Master_PDMA_Enable(SPI_RX);
+			#endif
+			
 			SPI_Master_PDMA_Enable(SPI_TX);
 		}
 
